@@ -1,0 +1,310 @@
+name: Release Windows Installer
+
+# 触发方式：仅手动触发（Actions 面板 → Run workflow）
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "版本号自增位（以上一个 Release tag 为基准）"
+        required: true
+        default: patch
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+      prerelease:
+        description: "标记为预发布（不抢占 latest）"
+        required: false
+        default: false
+        type: boolean
+      notes:
+        description: "附加发布说明（留空则自动生成 changelog）"
+        required: false
+        type: string
+      dry_run:
+        description: "只构建打包，不创建 Release（产物走 artifacts 下载）"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+# 同一时间只允许一个发布流程，避免并发抢同一个版本号
+concurrency:
+  group: release-windows
+  cancel-in-progress: false
+
+env:
+  APP_NAME: MusKitty
+  APP_PUBLISHER: Ink-dark
+  APP_ID: "{{8F3C1A55-6E42-4B7A-9C11-5D2E7A4F0B31}" # Inno Setup 的 {{ 转义 = 字面 {；首发后请勿再改动，否则会被认为是另一个软件
+  SOURCE_REPO: Ink-dark/MusKitty # 构建对象：主仓库（构建时再拉取独立 crate，本仓库不存源码）
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Build & Release (windows-latest)
+    runs-on: windows-latest
+
+    steps:
+      - name: 检出流水线仓库（Release 挂在本仓库）
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 生成 changelog 需要完整历史
+
+      # ------------------------------------------------------------------
+      # 0. 源码：本仓库不存源码，检出 Ink-dark/MusKitty 主仓库，
+      #    再用其 fetch-crates.ps1 克隆 11 个独立 crate 到 crates/
+      # ------------------------------------------------------------------
+      - name: 检出 MusKitty 主仓库源码
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: main
+          path: src/MusKitty
+
+      - name: 拉取独立 crate 仓库
+        working-directory: src/MusKitty
+        shell: pwsh
+        run: |
+          ./fetch-crates.ps1
+          if (-not (Test-Path crates/muskitty-cascade/.git)) { throw 'crate 拉取失败' }
+          Get-ChildItem crates -Directory | Select-Object -ExpandProperty Name
+
+      # ------------------------------------------------------------------
+      # 1. 版本号：读取最新 Release tag → 按所选位自增 → 作为本次 tag
+      #    无历史 Release 时从 v0.1.0 开始
+      # ------------------------------------------------------------------
+      - name: 解析并自增版本号
+        id: version
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BUMP: ${{ inputs.bump }}
+        run: |
+          set -euo pipefail
+
+          prev=$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+                  --jq '.[] | select(.draft | not) | .tag_name' \
+                | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+                | sort -V | tail -n1 || true)
+
+          if [ -z "${prev:-}" ]; then
+            major=0; minor=1; patch=0
+          else
+            v="${prev#v}"
+            IFS='.' read -r major minor patch <<< "$v"
+          fi
+
+          case "$BUMP" in
+            major) major=$((major + 1)); minor=0; patch=0 ;;
+            minor) minor=$((minor + 1)); patch=0 ;;
+            *)     patch=$((patch + 1)) ;;
+          esac
+
+          version="${major}.${minor}.${patch}"
+          tag="v${version}"
+
+          echo "previous=${prev:-<none>}" >> "$GITHUB_OUTPUT"
+          echo "version=$version"          >> "$GITHUB_OUTPUT"
+          echo "tag=$tag"                  >> "$GITHUB_OUTPUT"
+          {
+            echo "### 版本"
+            echo "- 上一个 Release：\`${prev:-<none>}\`"
+            echo "- 本次发布：\`$tag\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ------------------------------------------------------------------
+      # 2. 构建（Rust / MSVC 工具链已预装在 windows-latest 镜像中）
+      # ------------------------------------------------------------------
+      - name: 配置 Rust 工具链
+        shell: pwsh
+        run: |
+          rustup default stable
+          rustc -vV
+          cargo -V
+
+      - name: 缓存 cargo 依赖
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src/MusKitty/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('src/MusKitty/**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: 构建 Release
+        working-directory: src/MusKitty
+        shell: pwsh
+        # workspace 三个 member：renderer / network / chrome（应用入口 = muskitty-chrome.exe）
+        # 若只想构建应用本身，把下面一行换成：cargo build --release -p muskitty-chrome
+        run: cargo build --release --workspace
+
+      # ------------------------------------------------------------------
+      # 3. 收集产物到 staging/
+      # ------------------------------------------------------------------
+      - name: 收集产物
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist staging
+
+          shopt -s nullglob
+          exes=(src/MusKitty/target/release/*.exe)
+          if (( ${#exes[@]} == 0 )); then
+            echo "::error::src/MusKitty/target/release 下没有找到任何 .exe，请检查构建步骤"
+            exit 1
+          fi
+          cp -v "${exes[@]}" staging/
+
+          # 可选的随包资源（相对主仓库根，不存在就跳过）
+          for d in assets resources templates; do
+            if [ -d "src/MusKitty/$d" ]; then cp -r "src/MusKitty/$d" staging/; fi
+          done
+          for f in README.md LICENSE LICENSE.md LICENSE.txt; do
+            if [ -f "src/MusKitty/$f" ]; then cp "src/MusKitty/$f" staging/; fi
+          done
+
+          # 主程序：优先 muskitty-chrome.exe，否则取第一个
+          main_exe="$(basename "${exes[0]}")"
+          for e in "${exes[@]}"; do
+            [ "$(basename "$e")" = "muskitty-chrome.exe" ] && main_exe="muskitty-chrome.exe"
+          done
+          echo "MAIN_EXE=$main_exe" >> "$GITHUB_ENV"
+          echo "主程序：$main_exe"
+
+      # ------------------------------------------------------------------
+      # 4. 打包为 Windows 安装程序（Inno Setup）
+      # ------------------------------------------------------------------
+      - name: 准备 Inno Setup
+        shell: pwsh
+        run: |
+          $iscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path $iscc)) {
+            Write-Host 'Inno Setup 未预装，使用 chocolatey 安装...'
+            choco install innosetup -y --no-progress
+          }
+          if (-not (Test-Path $iscc)) { throw 'ISCC.exe 未找到，打包失败' }
+          Write-Host "ISCC: $iscc"
+
+      - name: 生成安装脚本并打包
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          cat > setup.iss <<ISS
+          #define MyAppName "${APP_NAME}"
+          #define MyAppVersion "${VERSION}"
+          #define MyAppPublisher "${APP_PUBLISHER}"
+          #define MyAppURL "https://github.com/${GITHUB_REPOSITORY}"
+          #define MyAppId "${APP_ID}"
+          #define MyAppExe "${MAIN_EXE}"
+
+          [Setup]
+          AppId={#MyAppId}
+          AppName={#MyAppName}
+          AppVersion={#MyAppVersion}
+          AppPublisher={#MyAppPublisher}
+          AppPublisherURL={#MyAppURL}
+          AppSupportURL={#MyAppURL}
+          AppUpdatesURL={#MyAppURL}
+          DefaultDirName={autopf}\{#MyAppName}
+          DefaultGroupName={#MyAppName}
+          UninstallDisplayName={#MyAppName} {#MyAppVersion}
+          OutputDir=dist
+          OutputBaseFilename={#MyAppName}-Setup-v{#MyAppVersion}
+          Compression=lzma2/max
+          SolidCompression=yes
+          ArchitecturesInstallIn64BitMode=x64compatible
+          WizardStyle=modern
+          DisableProgramGroupPage=auto
+          PrivilegesRequiredOverridesAllowed=dialog
+
+          [Languages]
+          Name: "english"; MessagesFile: "compiler:Default.isl"
+          Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
+
+          [Tasks]
+          Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加图标:"; Flags: unchecked
+
+          [Files]
+          Source: "staging\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+          [Icons]
+          Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExe}"
+          Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExe}"; Tasks: desktopicon
+
+          [Run]
+          Filename: "{app}\{#MyAppExe}"; Description: "立即启动 {#MyAppName}"; Flags: nowait postinstall skipifsilent
+          ISS
+
+          # 有 LICENSE 就挂到许可协议页
+          for lic in LICENSE LICENSE.md LICENSE.txt; do
+            if [ -f "$lic" ]; then
+              sed -i "/^\[Setup\]/a LicenseFile=$lic" setup.iss
+              break
+            fi
+          done
+
+          ISCC="/c/Program Files (x86)/Inno Setup 6/ISCC.exe"
+          [ -f "$ISCC" ] || ISCC="/c/Program Files/Inno Setup 6/ISCC.exe"
+          "$ISCC" setup.iss
+
+          ls -l dist
+
+      - name: 生成 SHA256 校验文件
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path dist -Filter *.exe | Select-Object -First 1
+          if (-not $exe) { throw 'dist 下没有找到安装包' }
+          $hash = (Get-FileHash $exe.FullName -Algorithm SHA256).Hash.ToLower()
+          "$hash  $($exe.Name)" | Set-Content -Path "dist/$($exe.BaseName).sha256.txt" -Encoding ascii
+          Write-Host "安装包：$($exe.Name)  SHA256=$hash"
+
+      - name: 上传安装包为 workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-Setup-v${{ steps.version.outputs.version }}
+          path: dist/*
+          if-no-files-found: error
+
+      # ------------------------------------------------------------------
+      # 5. 创建 Release 并上传成品
+      # ------------------------------------------------------------------
+      - name: 创建 Release 并上传安装包
+        if: ${{ inputs.dry_run != true }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+          NOTES: ${{ inputs.notes }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          set -euo pipefail
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::notice::Release $TAG 已存在，改为覆盖上传产物"
+            gh release upload "$TAG" dist/* --clobber
+            exit 0
+          fi
+
+          args=(--title "${APP_NAME} v${VERSION}" --target "$GITHUB_SHA")
+          if [ "$PRERELEASE" = "true" ]; then
+            args+=(--prerelease)
+          fi
+          if [ -n "${NOTES:-}" ]; then
+            args+=(--notes "$NOTES")
+          else
+            args+=(--generate-notes)
+          fi
+
+          gh release create "$TAG" dist/* "${args[@]}"
+
+          echo "已发布：https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
