@@ -1,0 +1,80 @@
+name: Build Artifacts
+
+# 纯构建产物流程：只构建 + 上传 workflow artifacts，不打包安装包、不创建 Release。
+# 用途：Inno Setup / 发布环节出问题时，随时用本流程取可用的构建产物；
+# 也可对任意分支/标签做一次干净构建验证。
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "要构建的源码 ref（MusKitty 主仓库的分支/标签）"
+        required: false
+        default: main
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-artifacts
+  cancel-in-progress: false
+
+env:
+  APP_NAME: MusKitty
+  SOURCE_REPO: Ink-dark/MusKitty
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build Artifacts (windows-latest)
+    runs-on: windows-latest
+
+    steps:
+      - name: 检出 MusKitty 主仓库源码
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.ref }}
+          path: src/MusKitty
+
+      - name: 拉取独立 crate 仓库
+        working-directory: src/MusKitty
+        shell: pwsh
+        run: |
+          ./fetch-crates.ps1
+          if (-not (Test-Path crates/muskitty-cascade/.git)) { throw 'crate 拉取失败' }
+
+      - name: 配置 Rust 工具链
+        shell: pwsh
+        run: |
+          rustup default stable
+          rustc -vV
+          cargo -V
+
+      - name: 缓存 cargo 依赖
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src/MusKitty/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('src/MusKitty/**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: 构建 Release
+        working-directory: src/MusKitty
+        shell: pwsh
+        run: cargo build --release --workspace
+
+      - name: 显示产物
+        shell: pwsh
+        run: Get-ChildItem src/MusKitty/target/release/*.exe | Format-Table Name, Length
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-binaries-${{ github.run_number }} (${{ inputs.ref }})
+          path: |
+            src/MusKitty/target/release/*.exe
+          if-no-files-found: error

@@ -177,6 +177,17 @@ jobs:
           echo "MAIN_EXE=$main_exe" >> "$GITHUB_ENV"
           echo "主程序：$main_exe"
 
+      # 原始构建产物先于打包上传：后续 Inno/打包环节无论因何失败，
+      # 已构建好的 exe 都能从 workflow artifacts 取回。
+      - name: 上传原始构建产物（先于打包）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-binaries-v${{ steps.version.outputs.version }}
+          path: |
+            src/MusKitty/target/release/*.exe
+          if-no-files-found: warn
+
       # ------------------------------------------------------------------
       # 4. 打包为 Windows 安装程序（Inno Setup）
       # ------------------------------------------------------------------
@@ -306,11 +317,12 @@ jobs:
           Write-Host "安装包：$($exe.Name)  SHA256=$hash"
 
       - name: 上传安装包为 workflow artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.APP_NAME }}-Setup-v${{ steps.version.outputs.version }}
           path: dist/*
-          if-no-files-found: error
+          if-no-files-found: warn
 
       # ------------------------------------------------------------------
       # 5. 创建 Release 并上传成品

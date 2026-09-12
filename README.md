@@ -2,6 +2,20 @@
 
 MusKitty 的构建/发布流水线仓库（本仓库不存源码）。
 
+## 工作流一览
+
+| 工作流 | 触发 | 作用 |
+|--------|------|------|
+| **Release Windows Installer** | 手动 | 构建 + Inno Setup 打包 + 创建 Release（含版本号自增） |
+| **Build Artifacts** | 手动 | 纯构建：只产出并上传 exe 构建产物，不打包、不发布 |
+
+### 兜底策略
+
+- Release 流程中，**原始构建产物在 Inno 打包之前就先上传**为 artifact——Inno 或后续
+  环节失败也能取回已构建的 exe。
+- Inno/发布环节彻底出问题时，用 **Build Artifacts** 流程对任意 ref（默认 `main`）
+  做一次干净构建并下载产物。
+
 ## Release Windows Installer（`.github/workflows/release-windows.yml`）
 
 手动触发（Actions → *Release Windows Installer* → Run workflow），流程：
