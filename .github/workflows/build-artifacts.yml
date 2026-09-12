@@ -42,7 +42,11 @@ jobs:
         shell: pwsh
         run: |
           ./fetch-crates.ps1
-          if (-not (Test-Path crates/muskitty-cascade/.git)) { throw 'crate 拉取失败' }
+          # 完整性断言读 crates.json（单一来源），脚本与 CI 不各自维护清单
+          $standalone = @((Get-Content crates.json -Raw -Encoding UTF8 | ConvertFrom-Json).standalone)
+          $missing = @($standalone | Where-Object { -not (Test-Path "crates/$_/.git") })
+          if ($missing.Count -gt 0) { throw "crate 拉取不完整: $($missing -join ', ')" }
+          Write-Host "已拉取 $($standalone.Count) 个独立 crate"
 
       - name: 配置 Rust 工具链
         shell: pwsh
