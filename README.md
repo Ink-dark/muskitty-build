@@ -11,9 +11,11 @@ MusKitty 的构建/发布流水线仓库（本仓库不存源码）。
 2. 以上一个 Release tag 为基准按所选位（patch/minor/major）自增版本号
    （无历史 Release 时从 `v0.1.0` 开始）
 3. `cargo build --release --workspace`（入口 `muskitty-chrome.exe`）
-4. Inno Setup 打包为 `MusKitty-Setup-vX.Y.Z.exe`（双语向导 + 桌面快捷方式任务 +
+4. 下载 Inno 非官方简体中文语言包（`Languages\Unofficial\ChineseSimplified.isl`，
+   失败时降级为仅英文向导，不阻断发布）
+5. Inno Setup 打包为 `MusKitty-Setup-vX.Y.Z.exe`（双语向导 + 桌面快捷方式任务 +
    许可协议页），生成 SHA256 校验文件
-5. 产物上传为 workflow artifact；非 dry-run 时创建 Release 并上传成品
+6. 产物上传为 workflow artifact；非 dry-run 时创建 Release 并上传成品
 
 ### 输入
 

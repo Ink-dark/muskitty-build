@@ -191,12 +191,42 @@ jobs:
           if (-not (Test-Path $iscc)) { throw 'ISCC.exe 未找到，打包失败' }
           Write-Host "ISCC: $iscc"
 
-      - name: 生成安装脚本并打包
+      - name: Download Inno Setup Chinese Language File
+        shell: pwsh
+        run: |
+          # 简体中文属 Inno 的非官方翻译，发行版不自带（在 Languages\Unofficial\）。
+          # 引擎内 .iss 引用 compiler:Languages\Unofficial\ChineseSimplified.isl。
+          $dir = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\Languages\Unofficial'
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          # 固定 URL：仅 https + 主机白名单（不涉及任何用户输入）
+          $uri = [Uri]'https://raw.githubusercontent.com/jrsoftware/issrc/refs/heads/main/Files/Languages/ChineseSimplified.isl'
+          if ($uri.Scheme -ne 'https' -or $uri.Host -ne 'raw.githubusercontent.com') {
+            throw "refusing unexpected URL: $uri"
+          }
+          try {
+            Invoke-WebRequest -Uri $uri -OutFile (Join-Path $dir 'ChineseSimplified.isl') -UseBasicParsing
+            "HAS_ZH_ISL=true" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            Write-Host 'ChineseSimplified.isl 已就绪（Languages\Unofficial）'
+          } catch {
+            # 不让发布流程死在第三方翻译文件上：降级为仅英文向导
+            "HAS_ZH_ISL=false" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            Write-Warning "中文语言包下载失败，安装包将只含英文向导：$_"
+          }
+
+      - name: 生成安装脚本
         shell: bash
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
+
+          # 中文语言包缺失时（下载步骤降级）只保留英文向导，避免 ISCC 报
+          # "Could not read ... ChineseSimplified.isl" 直接失败。
+          if [ "${HAS_ZH_ISL:-false}" = "true" ]; then
+            zh_line='Name: "chinesesimplified"; MessagesFile: "compiler:Languages\Unofficial\ChineseSimplified.isl"'
+          else
+            zh_line='; chinesesimplified skipped (language file unavailable)'
+          fi
 
           cat > setup.iss <<ISS
           #define MyAppName "${APP_NAME}"
@@ -228,7 +258,7 @@ jobs:
 
           [Languages]
           Name: "english"; MessagesFile: "compiler:Default.isl"
-          Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
+          ${zh_line}
 
           [Tasks]
           Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加图标:"; Flags: unchecked
@@ -252,11 +282,19 @@ jobs:
             fi
           done
 
-          ISCC="/c/Program Files (x86)/Inno Setup 6/ISCC.exe"
-          [ -f "$ISCC" ] || ISCC="/c/Program Files/Inno Setup 6/ISCC.exe"
-          "$ISCC" setup.iss
+          echo '--- setup.iss 已生成 ---'
+          grep -n 'MessagesFile\|AppId' setup.iss
 
-          ls -l dist
+      - name: Compile Installer
+        shell: pwsh
+        run: |
+          $iscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path $iscc)) { $iscc = Join-Path $env:ProgramFiles 'Inno Setup 6\ISCC.exe' }
+          if (-not (Test-Path $iscc)) { throw 'ISCC.exe 未找到，打包失败' }
+          Write-Host "ISCC: $iscc"
+          & $iscc setup.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC 编译失败，退出码 $LASTEXITCODE" }
+          Get-ChildItem dist | Format-Table Name, Length
 
       - name: 生成 SHA256 校验文件
         shell: pwsh
